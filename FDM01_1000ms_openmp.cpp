@@ -16,7 +16,7 @@ double dx = 0.015, dy = 0.015;//space step, 3cm*3cm
 double D = 0.001;//D: diffusion coefficient cm^2/ms
 
 /* Time Step */
-double dt = 0.02; // Time step (ms)
+double dt = 0.1; // Time step (ms)
 double t; // Time (ms)
 int steps; // Number of Steps
 int increment; // Loop Control Variable
@@ -165,7 +165,7 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	int nstep = 10 / dt; // snapshot interval 10ms to save data files
+	int nstep = 10 / dt; // snapshot interval 4ms to save data files
 	int index = 0;// filename index from 1-5
 	char filename[100];
 
@@ -176,13 +176,11 @@ int main(int argc, char* argv[])
 	ftime(&start);
 
 	int tid;
-	omp_set_num_threads(16);
 #pragma omp parallel private(ncount,tid)// create and destruction of threads takes time, so it's a good place to create all threads here!!
-	{		
+	{
 		tid = omp_get_thread_num();// Get the thread ID
-		printf("aaa from thread %d\n", tid); 
-
-		for (ncount = 0; ncount <= 1000 / dt; ncount++){//simulation time is 1000ms
+		printf("aaa from thread %d\n", tid);
+		for (ncount = 0; ncount <= 1000 / dt; ncount++){//simulation time is 160ms  160 / dt
 			if (tid == 0){// let thread 0 manage the boundaries
 				for (i = 1; i < nx + 1; i++){
 					//****no flux boundary conditions*****
@@ -220,6 +218,25 @@ int main(int argc, char* argv[])
 			}
 #pragma omp barrier // wait for the boundary update 
 
+			//*********** step 1 *******
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					dV2[i][j] = D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy));
+				}
+			}
+#pragma omp barrier
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					//Forward Euler
+					Vnew[i][j] = V[i][j] + dt / 2 * dV2[i][j];
+					V[i][j] = Vnew[i][j];
+				}
+			}
+#pragma omp barrier
+			//*********** step 1 *******
+
 			//*********** Center Differnce for Space *******
 #pragma omp for private(i,j) schedule(static)
 			for (i = 1; i < nx + 1; i++){
@@ -232,7 +249,7 @@ int main(int argc, char* argv[])
 					comp_ib(i, j);
 					comp_it(i, j);
 
-					dV2[i][j] = (-it[i][j] + D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy)));
+					dV2[i][j] = -it[i][j];
 				}
 			}
 #pragma omp barrier
@@ -257,8 +274,27 @@ int main(int argc, char* argv[])
 					V[i][j] = Vnew[i][j];
 				}
 			}
-
+#pragma omp barrier
+			
+			//*********** step 3 *******
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					dV2[i][j] = D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy));
+				}
+			}
+#pragma omp barrier
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					//Forward Euler
+					Vnew[i][j] = V[i][j] + dt / 2 * dV2[i][j];
+					V[i][j] = Vnew[i][j];
+				}
+			}
+			//*********** step 3 *******
 #pragma omp barrier // ensure all data is ready for next time step
+
 			////***********trancation 1/2 of the plane wave to generate a spiral wave******
 			//if (ncount == cutcount){
 			//	for (i = 1; i < nx / 2; i++){

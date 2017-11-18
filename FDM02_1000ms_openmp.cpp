@@ -1,4 +1,4 @@
-/* modified by Xiang Zhou, 2017/11/18 */
+/* Xiang Zhou, 2017/11/18*/
 
 //#include "stdafx.h"
 #include <iostream>
@@ -16,24 +16,27 @@ double dx = 0.015, dy = 0.015;//space step, 3cm*3cm
 double D = 0.001;//D: diffusion coefficient cm^2/ms
 
 /* Time Step */
-double dt = 0.02; // Time step (ms)
+double dt_max = 0.04; // Time step (ms)
+double dt_min = 0.001;
+double dt;
 double t; // Time (ms)
 int steps; // Number of Steps
 int increment; // Loop Control Variable
-int cutcount = 40 / dt;
+int cutcount = 40 / dt_max;
 
 /* Voltage */
-double V[nx + 2][ny + 2]; // Initial Voltage (mv)
-double dV2[nx + 2][ny + 2]; // second order derivatives of Voltage (mv)
-double Vnew[nx + 2][ny + 2];// New Voltage (mV)
+double V[nx + 2][nx + 2]; // Initial Voltage (mv)
+double dV2[nx + 2][nx + 2]; // second order derivatives of Voltage (mv)
+double dVdt[nx + 2][nx + 2]; // first order derivatives of Voltage (mv)
+double Vnew[nx + 2][nx + 2];// New Voltage (mV)
 double dvdt; // Change in Voltage / Change in Time (mV/ms)
 double dvdtnew; // New dv/dt (mV/ms)
 
 /* Total Current and Stimulus */
 double st; // Constant Stimulus (uA/cm^2)
 double tstim; //Time Stimulus is Applied (ms)//Time to begin stimulus
-int stimtime = (int)(0.6 / dt + 0.6); //Time period during which stimulus is applied 
-double it[nx + 1][ny + 1]; // Total current (uA/cm^2)
+int stimtime = (int)(0.6 / dt_max + 0.6); //Time period during which stimulus is applied 
+double it[nx + 1][nx + 1]; // Total current (uA/cm^2)
 
 /* Terms for Solution of Conductance and Reversal Potential */
 const double R = 8314; // Universal Gas Constant (J/kmol*K)
@@ -113,7 +116,12 @@ double ekp = ek1; // Reversal Potential of Plateau K Current (mV)
 //double kp; // K plateau factor
 
 /* Background Current */
-double ib[nx + 1][ny + 1]; // Background current (uA/uF)
+double ib[nx + 1][nx + 1]; // Background current (uA/uF)
+
+//temporary gate value
+double m0[nx + 1][nx + 1], h0[nx + 1][nx + 1], jj0[nx + 1][nx + 1];
+double d0[nx + 1][nx + 1], f0[nx + 1][nx + 1];
+double X0[nx + 1][nx + 1];
 
 //performance compared
 double Vmax, V_left = 0, V_right = 0, left_peak, right_peak, conduction_t = 0;
@@ -121,13 +129,15 @@ double APD90; // Time of 90% Repolarization
 double Vold, v_onset;
 
 /* Ion Current Functions */
-void comp_ina(int i, int j); // Calculates Fast Na Current
-void comp_ical(int i, int j); // Calculates Currents through L-Type Ca Channel
-void comp_ik(int i, int j); // Calculates Time-dependent K Current
+void comp_ina(int i, int j, double dt); // Calculates Fast Na Current
+void comp_ical(int i, int j, double dt); // Calculates Currents through L-Type Ca Channel
+void comp_ik(int i, int j, double dt); // Calculates Time-dependent K Current
 void comp_ik1(int i, int j); // Calculates Time-Independent K Current
 void comp_ikp(int i, int j); // Calculates Plateau K Current
 void comp_ib(int i, int j); // Calculates Background Current
 void comp_it(int i, int j); // Calculates Total Current
+double get_it(int i, int j, double dt);
+void new_gate(int i, int j);// renew gate value when t+dt
 
 FILE *single_ap;
 void performance();
@@ -165,24 +175,21 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	int nstep = 10 / dt; // snapshot interval 10ms to save data files
-	int index = 0;// filename index from 1-5
+	int nstep = 10 / dt_max; // snapshot interval 4 ms to save data files
+	int index = 0;// filename index
 	char filename[100];
-
-	//int chunk = 2;
+	omp_set_num_threads(8);
 
 	struct timeb start, end;
 	int diff;
 	ftime(&start);
 
-	int tid;
-	omp_set_num_threads(16);
+	int tid = 0;
 #pragma omp parallel private(ncount,tid)// create and destruction of threads takes time, so it's a good place to create all threads here!!
-	{		
+	{
 		tid = omp_get_thread_num();// Get the thread ID
-		printf("aaa from thread %d\n", tid); 
-
-		for (ncount = 0; ncount <= 1000 / dt; ncount++){//simulation time is 1000ms
+		printf("aaa from thread %d\n", tid);
+		for (ncount = 0; ncount <= 1000 / dt_max; ncount++){//simulation time is 160ms
 			if (tid == 0){// let thread 0 manage the boundaries
 				for (i = 1; i < nx + 1; i++){
 					//****no flux boundary conditions*****
@@ -193,6 +200,7 @@ int main(int argc, char* argv[])
 					V[0][j] = V[1][j];
 					V[nx + 1][j] = V[nx][j];
 				}
+
 				//**** save data in file "ap"
 				int fileflag = 0;
 				for (i = 1; i < nx + 1; i++){
@@ -214,52 +222,109 @@ int main(int argc, char* argv[])
 				if (fileflag == 1){
 					fclose(ap);
 				}
-				//**** save data in file "ap"	
-				performance();
-				t = t + dt;
+				//**** save data in file "ap"
+				performance();				
 			}
 #pragma omp barrier // wait for the boundary update 
 
-			//*********** Center Differnce for Space *******
+			//*********** step 1 *******
 #pragma omp for private(i,j) schedule(static)
 			for (i = 1; i < nx + 1; i++){
 				for (j = 1; j < ny + 1; j++){
-					comp_ina(i, j);
-					comp_ical(i, j);
-					comp_ik(i, j);
-					comp_ik1(i, j);
-					comp_ikp(i, j);
-					comp_ib(i, j);
-					comp_it(i, j);
+					dV2[i][j] = D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy));
+				}
+			}
+#pragma omp barrier
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					//Forward Euler
+					Vnew[i][j] = V[i][j] + dt_max / 2 * dV2[i][j];
+					V[i][j] = Vnew[i][j];
+				}
+			}
+#pragma omp barrier
+			//*********** step 1 *******
 
-					dV2[i][j] = (-it[i][j] + D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy)));
+			//*********** step 2 *******
+			dt = dt_max;
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					it[i][j] = get_it(i, j, dt);
+					dVdt[i][j] = -it[i][j];
 				}
 			}
 #pragma omp barrier
 
 			//*****stimulation with a plane waves****
-			//stimulus should be >= 0.6 ms which can make the peak to 41.5mV
-			if (ncount >= 1 && ncount <= stimtime) {
+			if (ncount >= 1 && ncount <= stimtime) { //stimulus is hold with 0.5 ms, 0.02*15 = 0.3 ms
 #pragma omp for private(i,j) schedule(static)
 				for (i = 1; i < nx + 1; i++){
 					for (j = 1; j <= 5; j++){
-						dV2[i][j] = dV2[i][j] + (-st);
+						dVdt[i][j] = dVdt[i][j] + (-st);
+					}
+				}
+#pragma omp barrier
+			}
+
+			int k0, k;
+#pragma omp for private(i,j, k0, k, dt) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					// adaptive time step
+					if (dVdt[i][j] > 0){
+						k0 = 5;
+					}else{
+						k0 = 1;
+					}
+					k = k0 + (int)(fabs(dVdt[i][j]) + 0.5); //round the value
+					if (k >(int)(dt_max / dt_min)){
+						k = (int)(dt_max / dt_min);
+					}
+					dt = dt_max / k;
+					int ttt;
+					double dcai;
+					for (ttt = 1; ttt <= k; ttt++){ //from t to t+dt_max, t=t+dt
+						it[i][j] = get_it(i, j, dt);
+						new_gate(i, j);//update the gate value
+						dcai = -0.0001*isi[i][j] + 0.07*(0.0001 - cai[i][j]);
+						cai[i][j] = cai[i][j] + dcai*dt;//update Cai
+						if (ncount >= 1 && ncount <= stimtime && j >= 1 && j <= 5) {
+							dVdt[i][j] = -it[i][j] + (-st);
+						}else{
+							dVdt[i][j] = -it[i][j];
+						}
+						V[i][j] = V[i][j] + dt*dVdt[i][j];
 					}
 				}
 			}
 #pragma omp barrier
+			//*********** step 2 *******
 
+			//*********** step 3 *******
+#pragma omp for private(i,j) schedule(static)
+			for (i = 1; i < nx + 1; i++){
+				for (j = 1; j < ny + 1; j++){
+					dV2[i][j] = D*((V[i + 1][j] + V[i - 1][j] - 2 * V[i][j]) / (dx*dx) + (V[i][j + 1] + V[i][j - 1] - 2 * V[i][j]) / (dy*dy));
+				}
+			}
+#pragma omp barrier
 #pragma omp for private(i,j) schedule(static)
 			for (i = 1; i < nx + 1; i++){
 				for (j = 1; j < ny + 1; j++){
 					//Forward Euler
-					Vnew[i][j] = V[i][j] + dt*dV2[i][j];
+					Vnew[i][j] = V[i][j] + dt_max / 2 * dV2[i][j];
 					V[i][j] = Vnew[i][j];
 				}
 			}
+#pragma omp barrier
+			//*********** step 3 *******
+			if (tid==0){
+				t = t + dt_max;
+			}
 
-#pragma omp barrier // ensure all data is ready for next time step
-			////***********trancation 1/2 of the plane wave to generate a spiral wave******
+			//***********trancation 1/2 of the plane wave to generate a spiral wave******
 			//if (ncount == cutcount){
 			//	for (i = 1; i < nx / 2; i++){
 			//		for (j = 1; j < ny; j++){
@@ -301,12 +366,34 @@ void performance(){
 	if (V[nx / 2][ny / 2] >= (Vmax - 0.9*(Vmax - (-88.654973))))
 		APD90 = t; //  Time of 90% Repolarization 
 }
-
 /********************************************************/
 /* Functions that describe the currents begin here */
 
+double get_it(int i, int j, double dt){
+	comp_ina(i, j, dt);
+	comp_ical(i, j, dt);
+	comp_ik(i, j, dt);
+	comp_ik1(i, j);
+	comp_ikp(i, j);
+	comp_ib(i, j);
+	comp_it(i, j);
+	return it[i][j];
+}
+
+// renew gate value when t+dt
+void new_gate(int i, int j){
+	m[i][j] = m0[i][j];
+	h[i][j] = h0[i][j];
+	jj[i][j] = jj0[i][j];
+
+	d[i][j] = d0[i][j];
+	f[i][j] = f0[i][j];
+
+	X[i][j] = X0[i][j];
+}
+
 //Fast sodium current
-void comp_ina(int i, int j) {
+void comp_ina(int i, int j, double dt) {
 	/*gate variables can not be shared, should be local due to data racing !!!!!!!!*/
 	double am = 0.32*(V[i][j] + 47.13) / (1 - exp(-0.1*(V[i][j] + 47.13)));
 	double bm = 0.08*exp(-V[i][j] / 11);
@@ -331,21 +418,21 @@ void comp_ina(int i, int j) {
 	double hss = ah*htau;
 	double jss = aj*jtau;
 
-	m[i][j] = mss - (mss - m[i][j])*exp(-dt / mtau);
-	h[i][j] = hss - (hss - h[i][j])*exp(-dt / htau);
-	jj[i][j] = jss - (jss - jj[i][j])*exp(-dt / jtau);
+	m0[i][j] = mss - (mss - m[i][j])*exp(-dt / mtau);
+	h0[i][j] = hss - (hss - h[i][j])*exp(-dt / htau);
+	jj0[i][j] = jss - (jss - jj[i][j])*exp(-dt / jtau);
 
-	ina[i][j] = gna*m[i][j] * m[i][j] * m[i][j] * h[i][j] * jj[i][j] * (V[i][j] - ena);
+	ina[i][j] = gna*m0[i][j] * m0[i][j] * m0[i][j] * h0[i][j] * jj0[i][j] * (V[i][j] - ena);
 }
 
 //Slow inward current
-void comp_ical(int i, int j) {
+void comp_ical(int i, int j, double dt) {
 	esi[i][j] = 7.7 - 13.0287*log(cai[i][j]);
 
-	double ad =  0.095*exp(-0.01*(V[i][j] - 5)) / (1 + exp(-0.072*(V[i][j] - 5)));
-	double bd =  0.07*exp(-0.017*(V[i][j] + 44)) / (1 + exp(0.05*(V[i][j] + 44)));
-	double af =  0.012*exp(-0.008*(V[i][j] + 28)) / (1 + exp(0.15*(V[i][j] + 28)));
-	double bf =  0.0065*exp(-0.02*(V[i][j] + 30)) / (1 + exp(-0.2*(V[i][j] + 30)));
+	double ad = 0.095*exp(-0.01*(V[i][j] - 5)) / (1 + exp(-0.072*(V[i][j] - 5)));
+	double bd = 0.07*exp(-0.017*(V[i][j] + 44)) / (1 + exp(0.05*(V[i][j] + 44)));
+	double af = 0.012*exp(-0.008*(V[i][j] + 28)) / (1 + exp(0.15*(V[i][j] + 28)));
+	double bf = 0.0065*exp(-0.02*(V[i][j] + 30)) / (1 + exp(-0.2*(V[i][j] + 30)));
 
 	double taud = 1 / (ad + bd);
 	double tauf = 1 / (af + bf);
@@ -353,34 +440,34 @@ void comp_ical(int i, int j) {
 	double dss = ad*taud;
 	double fss = af*tauf;
 
-	d[i][j] = dss - (dss - d[i][j])*exp(-dt / taud);
-	f[i][j] = fss - (fss - f[i][j])*exp(-dt / tauf);
+	d0[i][j] = dss - (dss - d[i][j])*exp(-dt / taud);
+	f0[i][j] = fss - (fss - f[i][j])*exp(-dt / tauf);
 
-	isi[i][j] = 0.09*d[i][j] * f[i][j] * (V[i][j] - esi[i][j]);
+	isi[i][j] = 0.09*d0[i][j] * f0[i][j] * (V[i][j] - esi[i][j]);
 
-	double dcai = -0.0001*isi[i][j] + 0.07*(0.0001 - cai[i][j]);
+	//dcai = -0.0001*isi[i][j] + 0.07*(0.0001 - cai[i][j]);
 
-	cai[i][j] = cai[i][j] + dcai*dt;
+	//cai[i][j] = cai[i][j] + dcai*dt;
 }
 
 //Time-dependent potassium current
-void comp_ik(int i, int j) {
-	double ax =  0.0005*exp(0.083*(V[i][j] + 50)) / (1 + exp(0.057*(V[i][j] + 50)));
-	double bx =  0.0013*exp(-0.06*(V[i][j] + 20)) / (1 + exp(-0.04*(V[i][j] + 20)));
+void comp_ik(int i, int j, double dt) {
+	double ax = 0.0005*exp(0.083*(V[i][j] + 50)) / (1 + exp(0.057*(V[i][j] + 50)));
+	double bx = 0.0013*exp(-0.06*(V[i][j] + 20)) / (1 + exp(-0.04*(V[i][j] + 20)));
 
 	double taux = 1 / (ax + bx);
 	double xss = ax*taux;
-	X[i][j] = xss - (xss - X[i][j])*exp(-dt / taux);
+
+	X0[i][j] = xss - (xss - X[i][j])*exp(-dt / taux);
 
 	double Xi;
 	if (V[i][j] > -100) {
 		Xi = 2.837*(exp(0.04*(V[i][j] + 77)) - 1) / ((V[i][j] + 77)*exp(0.04*(V[i][j] + 35)));
-	}
-	else {
+	}else {
 		Xi = 1;
 	}
 
-	ik[i][j] = gk*X[i][j] * Xi*(V[i][j] - ek);
+	ik[i][j] = gk*X0[i][j] * Xi*(V[i][j] - ek);
 }
 
 
@@ -408,6 +495,7 @@ void comp_ib(int i, int j) {
 /* Total sum of currents is calculated here, if the time is between
 stimtime = 0 and stimtime = 0.5 (ms), a stimulus is applied */
 void comp_it(int i, int j) {
+	//
 	//	if (t >= 5 && t<(5 + 0.5)) {
 	//		it[i][j] = st + ina[i][j] + isi[i][j] + ik[i][j] + ik1[i][j] + ikp[i][j] + ib[i][j];
 	//	}else {
